@@ -1,7 +1,25 @@
 """
 Continuous Soil Remediation Facility Optimizer - Streamlit App
 Determines optimal treatment cell configuration for continuous daily soil volumes
+
+Version: 0.19-bugfix
+Date:    2026-05-07
+
+Changelog:
+  0.19-bugfix (2026-05-07)
+    - Fixed Optimize Configuration button appearing to do nothing.
+      Root cause: optimize_cell_configuration() and find_max_daily_volume()
+      rejected any configuration with max_waiting > 0, which excluded normal
+      bounded steady-state stockpiles (e.g. weekend-induced buffers) and
+      filtered out essentially every realistic configuration, so the results
+      area never rendered.
+    - simulate_for_idle_days() now also returns a queue_growing flag based on
+      comparing peak stockpile in the first vs. second half of the simulation,
+      distinguishing genuine unbounded buildup from bounded oscillation.
+    - Sustainability check is now: idle_days == 0 AND not queue_growing.
 """
+
+__version__ = "0.19-bugfix"
 
 import streamlit as st
 import pandas as pd
@@ -209,13 +227,14 @@ def find_max_daily_volume(num_cells, cell_volume, daily_equipment_capacity,
     
     while low <= high:
         mid = (low + high) // 2
-        idle_days, max_waiting = simulate_for_idle_days(
+        idle_days, max_waiting, queue_growing = simulate_for_idle_days(
             num_cells, cell_volume, mid, daily_equipment_capacity,
             phase_params, weekend_params, simulation_days
         )
         
-        # Must have BOTH zero idle days AND zero queue buildup to be sustainable
-        if idle_days == 0 and max_waiting == 0:
+        # Sustainable means zero idle days AND no unbounded queue growth.
+        # A bounded steady-state stockpile (e.g. from weekend gaps) is fine.
+        if idle_days == 0 and not queue_growing:
             max_found = mid
             low = mid + 1
         else:
@@ -267,14 +286,17 @@ def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
         for num_cells in range(2, 13):
             
             # Run simulation at the PLANNED volume to check if it's sustainable
-            idle_days, max_waiting = simulate_for_idle_days(
+            idle_days, max_waiting, queue_growing = simulate_for_idle_days(
                 num_cells, cell_volume, daily_volume_cy, daily_equipment_capacity,
                 phase_params, weekend_params, simulation_days=180  # Longer sim for accuracy
             )
             
-            # Skip configurations that can't sustain the planned volume
-            # Must have zero idle days AND zero queue buildup
-            if idle_days > 0 or max_waiting > 0:
+            # Skip configurations that can't sustain the planned volume.
+            # Reject on idle days (cell shortage) or unbounded queue growth.
+            # A bounded steady-state stockpile is acceptable - it's normal
+            # for there to be some soil waiting briefly during loading or
+            # accumulating over weekends when receiving but not loading.
+            if idle_days > 0 or queue_growing:
                 continue
             
             # Calculate maximum daily volume this config can handle (for display)
@@ -335,7 +357,7 @@ def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
 
 def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipment_capacity,
                            phase_params, weekend_params, simulation_days=90):
-    """Simulation to count idle days and max stockpile
+    """Simulation to count idle days, peak stockpile, and detect queue buildup.
     
     NEW MODEL - Separate RECEIVE from LOAD:
     - RECEIVE: Trucks deliver soil → goes to STOCKPILE (independent of equipment)
@@ -343,8 +365,12 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
     - UNLOAD: Equipment moves soil from CELL → OUT
     - Equipment is a SHARED POOL - allocated based on priority setting
     
-    idle_day = a receive day where we couldn't load ANY soil (no cell available)
-    max_waiting = peak stockpile size (indicates if stockpiling is needed)
+    Returns (idle_days, max_waiting, queue_growing):
+        idle_days     = receive days where we couldn't load ANY soil (no cell available)
+        max_waiting   = peak stockpile size over the whole simulation
+        queue_growing = True if the stockpile peak in the second half of the simulation
+                        meaningfully exceeds the first half (i.e. unbounded buildup,
+                        not just transient/steady-state oscillation from weekend gaps)
     """
     
     def is_work_day(date, phase_type):
@@ -400,6 +426,11 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
     active_unloading_cell = None
     soil_waiting = 0  # STOCKPILE
     max_waiting = 0
+    # Track stockpile peak in each half of the simulation to detect unbounded
+    # growth (genuine queue buildup) vs bounded oscillation from weekend gaps.
+    first_half_max_waiting = 0
+    second_half_max_waiting = 0
+    sim_midpoint = simulation_days // 2
     idle_days = 0
     next_flip_num = 1
     
@@ -531,6 +562,10 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
             idle_days += 1
         
         max_waiting = max(max_waiting, soil_waiting)
+        if day < sim_midpoint:
+            first_half_max_waiting = max(first_half_max_waiting, soil_waiting)
+        else:
+            second_half_max_waiting = max(second_half_max_waiting, soil_waiting)
         
         # ============================================================
         # Treatment phases (don't use equipment)
@@ -554,7 +589,17 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
         
         current_date += timedelta(days=1)
     
-    return idle_days, max_waiting
+    # Detect unbounded queue buildup by comparing the stockpile peak in the
+    # second half of the simulation to the first half. A bounded queue (even
+    # one with a large weekend-induced steady-state) plateaus at the same peak
+    # regardless of simulation length, so the two halves match. An unbounded
+    # queue keeps growing, so the second-half peak meaningfully exceeds the
+    # first-half peak. We allow a small absolute tolerance (one day's intake)
+    # to absorb day-of-week noise in when the peak happens to fall.
+    growth = second_half_max_waiting - first_half_max_waiting
+    queue_growing = growth > daily_volume_cy
+    
+    return idle_days, max_waiting, queue_growing
 
 
 def is_valid_work_day(date, phase_name, weekend_params):
@@ -843,6 +888,7 @@ def main():
     )
     
     st.title("🏭 Continuous Soil Remediation Facility Optimizer")
+    st.caption(f"Version {__version__}")
     st.markdown("""
     This tool calculates the optimal treatment cell configuration for a continuous-flow 
     soil remediation facility based on daily incoming volume.
