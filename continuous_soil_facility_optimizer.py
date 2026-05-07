@@ -2,10 +2,25 @@
 Continuous Soil Remediation Facility Optimizer - Streamlit App
 Determines optimal treatment cell configuration for continuous daily soil volumes
 
-Version: 0.19-bugfix
+Version: 0.20-partial-fill
 Date:    2026-05-07
 
 Changelog:
+  0.20-partial-fill (2026-05-07)
+    - Cells now stop loading at the largest whole-day multiple of incoming
+      volume that fits ("effective fill"), instead of waiting an extra day
+      to add a partial top-off. E.g. a 2000 CY cell at 630 CY/day now loads
+      to 1890 CY (3 days) and transitions to Rip the following day, rather
+      than spending a 4th calendar day adding only 110 CY.
+    - New helper effective_fill_capacity(cell_volume, daily_volume).
+    - calculate_total_cycle_time() uses floor for load_workdays and sizes
+      unload_workdays to the effective fill rather than physical capacity.
+    - simulate_for_idle_days() and simulate_facility_schedule() use the
+      effective fill as the loading target.
+    - Optimizer results table now includes 'effective_fill_per_cell_cy';
+      'total_capacity_cy' is now operational throughput per cycle (effective
+      fill x num_cells), not physical capacity.
+
   0.19-bugfix (2026-05-07)
     - Fixed Optimize Configuration button appearing to do nothing.
       Root cause: optimize_cell_configuration() and find_max_daily_volume()
@@ -19,7 +34,7 @@ Changelog:
     - Sustainability check is now: idle_days == 0 AND not queue_growing.
 """
 
-__version__ = "0.19-bugfix"
+__version__ = "0.20-partial-fill"
 
 import streamlit as st
 import pandas as pd
@@ -87,6 +102,26 @@ def calculate_calendar_days_for_workdays(target_workdays, start_date, saturday_w
     return calendar_days
 
 
+def effective_fill_capacity(cell_volume_cy, daily_volume_cy):
+    """Return the largest whole-day load that fits in a cell.
+    
+    Cells stop loading at the largest multiple of the daily intake that fits,
+    rather than waiting an extra day for a partial top-off. The remaining
+    headroom (less than one day's intake) is intentionally left unused so the
+    cell can transition to Rip a day sooner.
+    
+    Example: 2000 CY cell at 630 CY/day -> 1890 CY (3 full days).
+    Edge case: if the cell is smaller than one day's intake, return the full
+    cell volume so the simulator still makes forward progress.
+    """
+    if daily_volume_cy <= 0:
+        return cell_volume_cy
+    whole_days = cell_volume_cy // daily_volume_cy
+    if whole_days == 0:
+        return cell_volume_cy
+    return int(whole_days * daily_volume_cy)
+
+
 def calculate_cell_dimensions(cell_volume_cy, depth_ft, aspect_ratio=2.0):
     """Calculate cell length and width from volume and depth
     Uses rectangular cells with consistent aspect ratio (Length:Width)
@@ -144,10 +179,18 @@ def calculate_total_cycle_time(cell_volume_cy, daily_incoming_volume, daily_equi
     Key: Loading time is based on INCOMING VOLUME, not equipment capacity.
     You can only load what actually arrives each day.
     Unloading time is based on equipment capacity.
+    
+    Cells are loaded only to their "effective fill" - the largest whole-day
+    multiple of incoming volume that fits - so loading takes a whole number
+    of receiving days and the cell never sits half-full waiting for a
+    partial-day top-off. Unload then handles only that effective fill.
     """
     
-    # Loading time - constrained by incoming volume, not equipment
-    load_workdays = math.ceil(cell_volume_cy / daily_incoming_volume)
+    fill_per_cell = effective_fill_capacity(cell_volume_cy, daily_incoming_volume)
+    
+    # Loading time - constrained by incoming volume, not equipment.
+    # With the effective-fill rule this is always a whole number of workdays.
+    load_workdays = max(1, fill_per_cell // daily_incoming_volume) if daily_incoming_volume > 0 else 1
     load_calendar_days = calculate_calendar_days_for_workdays(
         load_workdays, datetime.now(), load_saturday, load_sunday
     )
@@ -167,8 +210,9 @@ def calculate_total_cycle_time(cell_volume_cy, daily_incoming_volume, daily_equi
         dry_days, datetime.now(), dry_saturday, dry_sunday
     )
     
-    # Unloading time - constrained by equipment capacity
-    unload_workdays = math.ceil(cell_volume_cy / daily_equipment_capacity)
+    # Unloading time - constrained by equipment capacity, sized to the
+    # effective fill (i.e. only as much soil as is actually in the cell).
+    unload_workdays = math.ceil(fill_per_cell / daily_equipment_capacity)
     unload_calendar_days = calculate_calendar_days_for_workdays(
         unload_workdays, datetime.now(), unload_saturday, unload_sunday
     )
@@ -315,7 +359,8 @@ def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
             buffer_pct = (buffer_cy / daily_volume_cy) * 100
             
             # Calculate metrics
-            total_capacity = cell_volume * num_cells
+            fill_per_cell = effective_fill_capacity(cell_volume, daily_volume_cy)
+            total_capacity = fill_per_cell * num_cells  # operational throughput per cycle
             
             # Score: Primary=idle_days, Secondary=num_cells, Tertiary=cell_volume
             # Lower is better for all three
@@ -328,6 +373,7 @@ def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
             
             results.append({
                 'cell_volume_cy': cell_volume,
+                'effective_fill_per_cell_cy': fill_per_cell,
                 'num_cells': num_cells,
                 'load_days': cycle_info['load_calendar_days'],
                 'cycle_days': cycle_info['total_calendar_days'],
@@ -409,6 +455,11 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
             if is_sunday and not weekend_params.get('dry_sunday', False):
                 return False
         return True
+    
+    # Cells stop loading at the largest whole-day multiple of incoming volume
+    # that fits, leaving a small headroom unused so the cell can transition to
+    # Rip a day sooner instead of waiting for a partial-day top-off.
+    fill_per_cell = effective_fill_capacity(cell_volume, daily_volume_cy)
     
     class CellState:
         def __init__(self, cell_num):
@@ -532,7 +583,7 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
                 # Load the active cell
                 cell = cells[active_loading_cell]
                 if cell.phase == 'Loading':
-                    space_remaining = cell_volume - cell.soil_volume
+                    space_remaining = fill_per_cell - cell.soil_volume
                     load_amount = min(space_remaining, equipment_remaining, soil_waiting)
                     if load_amount > 0:
                         cell.soil_volume += load_amount
@@ -541,8 +592,8 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
                         equipment_used += load_amount
                         loaded_today = True
                     
-                    # Check if cell is full
-                    if cell.soil_volume >= cell_volume:
+                    # Check if cell has reached its effective fill
+                    if cell.soil_volume >= fill_per_cell:
                         cell.pending_transition = 'Rip'
                         active_loading_cell = None
             
@@ -639,6 +690,11 @@ def simulate_facility_schedule(config, daily_volume_cy, daily_equipment_capacity
     
     cell_volume = config['cell_volume_cy']
     num_cells = int(config['num_cells'])
+    
+    # Cells are loaded only to their effective fill (largest whole-day multiple
+    # of incoming volume that fits) so they transition to Rip without waiting
+    # for a partial-day top-off.
+    fill_per_cell = effective_fill_capacity(cell_volume, daily_volume_cy)
     
     # Get equipment priority setting
     equipment_priority = weekend_params.get('equipment_priority', 'unload_first')
@@ -780,7 +836,7 @@ def simulate_facility_schedule(config, daily_volume_cy, daily_equipment_capacity
                 # Load the active cell
                 cell = cells[active_loading_cell]
                 if cell.phase == 'Loading':
-                    space_remaining = cell_volume - cell.soil_volume
+                    space_remaining = fill_per_cell - cell.soil_volume
                     load_amount = min(space_remaining, equipment_remaining, soil_waiting)
                     if load_amount > 0:
                         cell.soil_volume += load_amount
@@ -791,8 +847,8 @@ def simulate_facility_schedule(config, daily_volume_cy, daily_equipment_capacity
                         total_loaded += load_amount
                         cell_load_amounts[active_loading_cell] = cell_load_amounts.get(active_loading_cell, 0) + load_amount
                     
-                    # Check if cell is full
-                    if cell.soil_volume >= cell_volume:
+                    # Check if cell has reached its effective fill
+                    if cell.soil_volume >= fill_per_cell:
                         cell.pending_transition = 'Rip'
                         active_loading_cell = None
             
