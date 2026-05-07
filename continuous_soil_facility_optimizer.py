@@ -2,10 +2,17 @@
 Continuous Soil Remediation Facility Optimizer - Streamlit App
 Determines optimal treatment cell configuration for continuous daily soil volumes
 
-Version: 0.24-load-first-default
+Version: 0.25-raise-input-caps
 Date:    2026-05-07
 
 Changelog:
+  0.25-raise-input-caps (2026-05-07)
+    - Raised the artificial caps on Daily Soil Volume (was 5000) and Daily
+      Equipment Capacity (was 2000) to 100000 CY/day each. The previous
+      caps were arbitrary and rejected realistic large-facility inputs;
+      the new ceiling is generous enough for any plausible scenario while
+      still catching obvious typos.
+
   0.24-load-first-default (2026-05-07)
     - Equipment Priority default flipped from 'Unload First' to 'Load First'.
       Continuous-flow operation requires that the daily intake always be
@@ -80,7 +87,7 @@ Changelog:
     - Sustainability check is now: idle_days == 0 AND not queue_growing.
 """
 
-__version__ = "0.24-load-first-default"
+__version__ = "0.25-raise-input-caps"
 
 import streamlit as st
 import pandas as pd
@@ -1046,7 +1053,7 @@ def main():
         daily_volume = st.number_input(
             "Daily Soil Volume (CY/day)",
             min_value=10,
-            max_value=5000,
+            max_value=100000,
             value=300,
             step=10,
             help="Average daily volume of soil arriving at facility"
@@ -1057,7 +1064,7 @@ def main():
         daily_equipment_capacity = st.number_input(
             "Daily Equipment Capacity (CY/day)",
             min_value=50,
-            max_value=2000,
+            max_value=100000,
             value=750,
             step=25,
             help="Total soil that can be moved per day (loading + unloading combined from shared equipment pool)."
