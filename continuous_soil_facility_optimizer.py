@@ -2,10 +2,24 @@
 Continuous Soil Remediation Facility Optimizer - Streamlit App
 Determines optimal treatment cell configuration for continuous daily soil volumes
 
-Version: 0.23-cycle-priority
+Version: 0.24-load-first-default
 Date:    2026-05-07
 
 Changelog:
+  0.24-load-first-default (2026-05-07)
+    - Equipment Priority default flipped from 'Unload First' to 'Load First'.
+      Continuous-flow operation requires that the daily intake always be
+      loadable; reserving equipment for loading first guarantees this.
+      Excess equipment (capacity > daily intake) is then used for unloading.
+      This eliminates the chunky load patterns (e.g. Load(110), Load(1150))
+      seen previously when a full-cell unload greedily consumed equipment
+      and starved the loading operation for the day.
+    - Radio labels and help text updated to explain why 'Load First' is the
+      safe default for continuous-flow scenarios. 'Unload First' remains
+      available for explicit catch-up scenarios.
+    - Default in simulator .get() fallbacks aligned to 'load_first' too, so
+      the behavior is consistent if the dict key is ever missing.
+
   0.23-cycle-priority (2026-05-07)
     - Optimizer now ranks viable configurations by SHORTEST CYCLE TIME first,
       with fewer cells and smaller cell size as tiebreakers. The previous
@@ -66,7 +80,7 @@ Changelog:
     - Sustainability check is now: idle_days == 0 AND not queue_growing.
 """
 
-__version__ = "0.23-cycle-priority"
+__version__ = "0.24-load-first-default"
 
 import streamlit as st
 import pandas as pd
@@ -541,7 +555,7 @@ def simulate_for_idle_days(num_cells, cell_volume, daily_volume_cy, daily_equipm
     next_flip_num = 1
     
     # Get equipment priority setting
-    equipment_priority = weekend_params.get('equipment_priority', 'unload_first')
+    equipment_priority = weekend_params.get('equipment_priority', 'load_first')
     
     for day in range(simulation_days):
         # Process pending transitions at START of day
@@ -752,7 +766,7 @@ def simulate_facility_schedule(config, daily_volume_cy, daily_equipment_capacity
     fill_per_cell = effective_fill_capacity(cell_volume, daily_volume_cy)
     
     # Get equipment priority setting
-    equipment_priority = weekend_params.get('equipment_priority', 'unload_first')
+    equipment_priority = weekend_params.get('equipment_priority', 'load_first')
     
     # Initialize cell tracking
     class CellState:
@@ -1051,10 +1065,18 @@ def main():
         
         equipment_priority = st.radio(
             "Equipment Priority",
-            options=["unload_first", "load_first"],
+            options=["load_first", "unload_first"],
             index=0,
-            format_func=lambda x: "Unload First (free cells faster)" if x == "unload_first" else "Load First (clear stockpile faster)",
-            help="When equipment is limited, which operation gets priority? 'Unload First' recommended for catch-up scenarios."
+            format_func=lambda x: (
+                "Load First (guarantees daily intake; excess equipment goes to unload)"
+                if x == "load_first"
+                else "Unload First (free cells fastest; can starve loading on busy days)"
+            ),
+            help=(
+                "Continuous-flow operation needs the daily intake to always be loadable, "
+                "so 'Load First' is the safe default. Switch to 'Unload First' only for "
+                "catch-up scenarios where you need to clear cells as fast as possible."
+            )
         )
         
         # Phase Durations
