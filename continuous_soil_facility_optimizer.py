@@ -2,10 +2,20 @@
 Continuous Soil Remediation Facility Optimizer - Streamlit App
 Determines optimal treatment cell configuration for continuous daily soil volumes
 
-Version: 0.22-fill-display
+Version: 0.23-cycle-priority
 Date:    2026-05-07
 
 Changelog:
+  0.23-cycle-priority (2026-05-07)
+    - Optimizer now ranks viable configurations by SHORTEST CYCLE TIME first,
+      with fewer cells and smaller cell size as tiebreakers. The previous
+      ordering (fewest cells first) tended to recommend large cells with long
+      load/unload phases; the new ordering recommends configs that turn each
+      cell around fastest.
+    - Score formula updated; spacing of weights guarantees the priority
+      order across realistic value ranges.
+    - "Best Configuration" tooltip updated to describe the new ranking.
+
   0.22-fill-display (2026-05-07)
     - Results display now surfaces the operational fill alongside the
       physical cell size in three places:
@@ -56,7 +66,7 @@ Changelog:
     - Sustainability check is now: idle_days == 0 AND not queue_growing.
 """
 
-__version__ = "0.22-fill-display"
+__version__ = "0.23-cycle-priority"
 
 import streamlit as st
 import pandas as pd
@@ -319,9 +329,10 @@ def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
                                 min_cell_volume=100, max_cell_volume=5000, 
                                 step_size=100, cell_sizes=None):
     """Find optimal cell configurations prioritized by:
-    1. Zero idle days (never turn away work)
-    2. Fewest cells (minimize capital cost)
-    3. Smallest cell size (if tied on cells)
+    1. Zero idle days (never turn away work)  -- hard requirement
+    2. Shortest cycle time (fastest turnaround per cell)
+    3. Fewest cells (minimize capital cost)
+    4. Smallest cell size (smaller footprint when otherwise tied)
     
     Runs simulation to determine actual idle days for each configuration.
     Only returns configurations that can handle the planned daily volume.
@@ -398,14 +409,21 @@ def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
             # Calculate metrics
             fill_per_cell = effective_fill_capacity(cell_volume, daily_volume_cy)
             total_capacity = fill_per_cell * num_cells  # operational throughput per cycle
+            cycle_days = cycle_info['total_calendar_days']
             
-            # Score: Primary=idle_days, Secondary=num_cells, Tertiary=cell_volume
-            # Lower is better for all three
-            # Weight idle_days very heavily - it's the primary constraint
+            # Score: lower is better.
+            # Priority order:
+            #   1. Zero idle days  (filtered above; kept as failsafe in score)
+            #   2. Shortest cycle time
+            #   3. Fewest cells
+            #   4. Smallest cell size
+            # Weights are spaced so each higher-priority field always dominates
+            # the lower-priority fields across realistic value ranges.
             score = (
-                idle_days * 100000 +  # Primary: zero idle days is critical
-                num_cells * 1000 +     # Secondary: fewer cells better
-                cell_volume            # Tertiary: smaller cells if tied
+                idle_days  * 10_000_000_000 +  # Failsafe: zero idle days is critical
+                cycle_days *     10_000_000 +  # Primary: shortest cycle time wins
+                num_cells  *         10_000 +  # Secondary: fewer cells if cycle ties
+                cell_volume                    # Tertiary: smaller cells if all else ties
             )
             
             results.append({
@@ -1202,7 +1220,7 @@ def main():
                         f"{int(best['num_cells'])} × {int(best['cell_volume_cy'])} CY",
                         delta=fill_note(best),
                         delta_color="off",
-                        help="Fewest cells with zero idle days"
+                        help="Shortest cycle time with zero idle days. Ties broken by fewer cells, then smaller cell size."
                     )
                 else:
                     best = results_df.iloc[0]
