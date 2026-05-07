@@ -2,10 +2,32 @@
 Continuous Soil Remediation Facility Optimizer - Streamlit App
 Determines optimal treatment cell configuration for continuous daily soil volumes
 
-Version: 0.20-partial-fill
+Version: 0.22-fill-display
 Date:    2026-05-07
 
 Changelog:
+  0.22-fill-display (2026-05-07)
+    - Results display now surfaces the operational fill alongside the
+      physical cell size in three places:
+        * "Best Configuration" summary metric (delta line)
+        * Configuration dropdown options (inline)
+        * "Cell Size" detail metric for the selected config (delta line)
+      Format: "loads to {fill} CY (uses {N} days of intake)".
+    - "Total Capacity" metric tooltip now clarifies it is operational
+      throughput per cycle (effective fill x num_cells), not physical
+      capacity, matching the change in 0.20.
+
+  0.21-standard-sizes (2026-05-07)
+    - Min/Max Cell Size inputs are now dropdowns restricted to the standard
+      buildable sizes (1500, 2000, 2500, 3000, 3500, 4000 CY) defined in the
+      STANDARD_CELL_SIZES constant. The Max dropdown is dynamically filtered
+      to options >= the chosen Min so the range is always non-empty.
+    - optimize_cell_configuration() accepts a new optional cell_sizes
+      parameter; when supplied, the optimizer iterates over exactly those
+      sizes (filtered to the min/max range) rather than sweeping every
+      step_size CY. This avoids producing redundant rows for sizes nobody
+      would actually build.
+
   0.20-partial-fill (2026-05-07)
     - Cells now stop loading at the largest whole-day multiple of incoming
       volume that fits ("effective fill"), instead of waiting an extra day
@@ -34,7 +56,7 @@ Changelog:
     - Sustainability check is now: idle_days == 0 AND not queue_growing.
 """
 
-__version__ = "0.20-partial-fill"
+__version__ = "0.22-fill-display"
 
 import streamlit as st
 import pandas as pd
@@ -49,6 +71,11 @@ import math
 # Typical soil density: ~1.5 tons/CY (compacted)
 # This can be adjusted based on soil type
 SOIL_DENSITY_LB_PER_CY = 2700  # ~1.35 tons/CY
+
+# Standard cell sizes the facility actually builds. The optimizer only
+# considers sizes from this list; in-between dimensions aren't realistic
+# construction targets.
+STANDARD_CELL_SIZES = [1500, 2000, 2500, 3000, 3500, 4000]
 
 # ============================================================================
 # Helper Functions
@@ -290,7 +317,7 @@ def find_max_daily_volume(num_cells, cell_volume, daily_equipment_capacity,
 def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
                                 phase_params, weekend_params,
                                 min_cell_volume=100, max_cell_volume=5000, 
-                                step_size=100):
+                                step_size=100, cell_sizes=None):
     """Find optimal cell configurations prioritized by:
     1. Zero idle days (never turn away work)
     2. Fewest cells (minimize capital cost)
@@ -299,12 +326,22 @@ def optimize_cell_configuration(daily_volume_cy, daily_equipment_capacity,
     Runs simulation to determine actual idle days for each configuration.
     Only returns configurations that can handle the planned daily volume.
     Limited to top 10 results.
+    
+    If cell_sizes is provided, the optimizer iterates over exactly those
+    sizes (after filtering to the min/max range). Otherwise it sweeps the
+    range in step_size increments. Pass cell_sizes when only certain
+    physically buildable sizes are practical.
     """
     
     results = []
     
-    # Test different cell sizes
-    for cell_volume in range(min_cell_volume, max_cell_volume + 1, step_size):
+    # Build the list of cell sizes to evaluate
+    if cell_sizes is not None:
+        sizes_to_test = [s for s in cell_sizes if min_cell_volume <= s <= max_cell_volume]
+    else:
+        sizes_to_test = list(range(min_cell_volume, max_cell_volume + 1, step_size))
+    
+    for cell_volume in sizes_to_test:
         
         # Calculate cycle time
         cycle_info = calculate_total_cycle_time(
@@ -1045,22 +1082,20 @@ def main():
         # Optimization Parameters
         st.subheader("Optimization Constraints")
         
-        min_cell_size = st.number_input(
+        min_cell_size = st.selectbox(
             "Min Cell Size (CY)",
-            min_value=100,
-            max_value=5000,
-            value=900,
-            step=100,
-            help="Minimum cell size to consider"
+            options=STANDARD_CELL_SIZES,
+            index=0,  # default to smallest standard size (1500)
+            help="Smallest cell size to consider. Only standard buildable sizes are listed."
         )
         
-        max_cell_size = st.number_input(
+        # Max options must be >= the chosen min so the range is non-empty
+        max_options = [s for s in STANDARD_CELL_SIZES if s >= min_cell_size]
+        max_cell_size = st.selectbox(
             "Max Cell Size (CY)",
-            min_value=500,
-            max_value=10000,
-            value=5000,
-            step=100,
-            help="Maximum cell size to consider"
+            options=max_options,
+            index=len(max_options) - 1,  # default to largest available
+            help="Largest cell size to consider. Only standard buildable sizes are listed."
         )
         
         run_button = st.button("🔍 Optimize Configuration", type="primary", use_container_width=True)
@@ -1099,7 +1134,7 @@ def main():
                 weekend_params,
                 min_cell_volume=min_cell_size,
                 max_cell_volume=max_cell_size,
-                step_size=100
+                cell_sizes=STANDARD_CELL_SIZES
             )
             
             # Store in session state
@@ -1141,6 +1176,15 @@ def main():
             # Count zero-idle configurations
             zero_idle_configs = results_df[results_df['idle_days'] == 0]
             
+            # Helper to describe how a cell actually loads (physical size vs.
+            # operational fill). With the partial-fill rule, a 2000 CY cell at
+            # 630 CY/day shows "loads to 1890 CY (uses 3 days of intake)".
+            def fill_note(row):
+                fill = int(row['effective_fill_per_cell_cy'])
+                days = int(row['cycle_breakdown']['load_workdays'])
+                day_word = "day" if days == 1 else "days"
+                return f"loads to {fill} CY (uses {days} {day_word} of intake)"
+            
             if len(zero_idle_configs) > 0:
                 st.success(f"✅ Found {len(zero_idle_configs)} configurations with continuous operation (zero idle days)")
             else:
@@ -1156,6 +1200,8 @@ def main():
                     st.metric(
                         "🏆 Best Configuration",
                         f"{int(best['num_cells'])} × {int(best['cell_volume_cy'])} CY",
+                        delta=fill_note(best),
+                        delta_color="off",
                         help="Fewest cells with zero idle days"
                     )
                 else:
@@ -1246,7 +1292,12 @@ def main():
                 selected_index = st.selectbox(
                     "Choose configuration:",
                     options=range(len(filtered_df)),
-                    format_func=lambda x: f"{int(filtered_df.iloc[x]['num_cells'])} × {int(filtered_df.iloc[x]['cell_volume_cy'])} CY (max {int(filtered_df.iloc[x]['max_daily_volume'])} CY/day)",
+                    format_func=lambda x: (
+                        f"{int(filtered_df.iloc[x]['num_cells'])} × "
+                        f"{int(filtered_df.iloc[x]['cell_volume_cy'])} CY  "
+                        f"— {fill_note(filtered_df.iloc[x])}  "
+                        f"| max {int(filtered_df.iloc[x]['max_daily_volume'])} CY/day"
+                    ),
                     index=0,
                     key=f"config_selector_{run_id}"
                 )
@@ -1265,11 +1316,21 @@ def main():
             detail_col1, detail_col2, detail_col3, detail_col4 = st.columns(4)
             
             with detail_col1:
-                st.metric("Cell Size", f"{selected_config['cell_volume_cy']:.0f} CY")
+                st.metric(
+                    "Cell Size",
+                    f"{selected_config['cell_volume_cy']:.0f} CY",
+                    delta=fill_note(selected_config),
+                    delta_color="off",
+                    help="Physical cell size. Loads only to the largest whole-day multiple of incoming volume that fits."
+                )
                 st.metric("Number of Cells", f"{int(selected_config['num_cells'])}")
             
             with detail_col2:
-                st.metric("Total Capacity", f"{selected_config['total_capacity_cy']:.0f} CY")
+                st.metric(
+                    "Total Capacity",
+                    f"{selected_config['total_capacity_cy']:.0f} CY",
+                    help="Operational throughput per cycle = effective fill per cell × number of cells."
+                )
                 st.metric("Full Cycle", f"{selected_config['cycle_days']:.0f} days")
             
             with detail_col3:
